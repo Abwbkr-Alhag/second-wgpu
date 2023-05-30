@@ -1,0 +1,5 @@
+newmtl LineMaterial
+Ka 1.0 1.0 1.0  # Ambient color (optional)
+Kd 1.0 1.0 1.0  # Diffuse color
+Ks 0.0 0.0 0.0  # Specular color
+Ns 0.0          # Shininess (optional)
