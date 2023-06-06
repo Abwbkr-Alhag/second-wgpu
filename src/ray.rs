@@ -3,7 +3,7 @@ use crate::camera::{Camera, Projection};
 use crate::collision::{Collider, BVTree};
 use crate::aab::{AxisAlignedBounding};
 
-const PRECISION: f32 = 0.5;
+const PRECISION: f32 = 0.15;
 const MULTIPLICITY: u32 = 1000;
 
 pub struct Ray {

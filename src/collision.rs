@@ -1,22 +1,31 @@
 use cgmath::{Point3, Vector3};
 use std::marker::PhantomData;
 use std::ptr::NonNull;
-use crate::aab::{AxisAlignedBounding};
+use crate::aab::{AxisAlignedBounding, PADDING};
+use crate::{ModelUsed};
+use crate::gjk::{GJKModel, gjk};
 use std::iter::IntoIterator;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque, HashMap};
 use std::hash::{Hash, Hasher};
 use std::fmt::Debug;
 
 pub trait Collider {
     fn position(&self) -> Point3<f32>;
+    fn set_position(&mut self, new_position: Point3<f32>);
+    fn velocity(&self) -> Vector3<f32>;
+    fn set_velocity(&mut self, new_velocity: Vector3<f32>);
+    fn force(&self) -> Vector3<f32>;
+    fn set_force(&mut self, new_force: Vector3<f32>);
+    fn mass(&self) -> f32;
     fn scale(&self) -> Vector3<f32>;
     fn id(&self) -> usize;
-    fn set_position(&mut self, new_position: Point3<f32>);
+    fn model_used(&self) -> ModelUsed;
 }
 
 
 pub struct BVTree<T: AxisAlignedBounding<V>, V: Collider> {
     root: TreeNode<T, V>,
+    gjk_model_table: HashMap<ModelUsed, GJKModel>,
     size: usize,
 }
 
@@ -77,16 +86,11 @@ struct Node<T: AxisAlignedBounding<V>, V: Collider> {
     child_is: ChildIs,
 }
 
-impl<T: AxisAlignedBounding<V>, V: Collider> Node<T, V> {
-    fn is_leaf(&self) -> bool {
-        // Left and Right should be none as there is either 0 or 2 children in a BVTree
-        self.left.is_none() && self.right.is_none()
-    }
-}
 impl<'a, T: AxisAlignedBounding<V, Aab = T> + std::fmt::Debug + Clone, V : Collider> BVTree<T, V> {
-    pub fn new() -> Self {
+    pub fn new(gjk_model_table: HashMap<ModelUsed, GJKModel>) -> Self {
         Self {
             root: None,
+            gjk_model_table,
             size: 0,
         }
     }
@@ -240,21 +244,19 @@ impl<'a, T: AxisAlignedBounding<V, Aab = T> + std::fmt::Debug + Clone, V : Colli
         }
     }
     
-    pub fn update(&mut self, collider_id: usize, new_position: Point3<f32>, aab: &T) {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-        let old_position = aab.position();
-        let mut removed_collider = self.remove(collider_id, aab);
-        (removed_collider).set_position(
-            Point3 {
-                x: old_position.x + rng.gen_range(-0.75..0.75),
-                y: old_position.y + rng.gen_range(-0.75..0.75),
-                z: old_position.z + rng.gen_range(-0.75..0.75),
-            }               
-        );
-        // self.print_pretty("".to_string());
-        self.insert(removed_collider);
-        // self.print_pretty("".to_string());
+    pub fn update(&mut self, collider_id: usize, aab_position: Point3<f32>, new_position: Point3<f32>, aab: &T, mutable_collider: &mut V) {
+        let position_diff = new_position - aab_position;
+        let largest_diff = position_diff.x.max(position_diff.y.max(position_diff.z));
+        if largest_diff.abs() < PADDING {
+            let removed_collider = mutable_collider;
+            (removed_collider).set_position(new_position);
+        } else {
+            let mut removed_collider = self.remove(collider_id, aab);
+            (removed_collider).set_position(new_position);
+            // self.print_pretty("".to_string());
+            self.insert(removed_collider);
+            // self.print_pretty("".to_string());
+        }
     }
 
     pub fn get_branches<'b>(&'b self) -> Vec<&'b T> {
@@ -276,10 +278,10 @@ impl<'a, T: AxisAlignedBounding<V, Aab = T> + std::fmt::Debug + Clone, V : Colli
     }
     
 
-    pub fn get_possible_pairs(&self) -> HashSet<ColliderPair<V>> {
+    pub fn get_possible_pairs(&mut self) -> HashSet<ColliderPair<V>> {
         let mut set: HashSet<ColliderPair<V>> = HashSet::new();
         for inst in self.node_iter() {
-            let collisions: Vec<(&V, &V)> = self.get_collisions(&inst);
+            let collisions: Vec<(&V, &V)> = self.get_collisions(inst);
             for collision in collisions {
                 let pair = ColliderPair(collision.0, collision.1);
                 set.insert(pair);
@@ -288,22 +290,37 @@ impl<'a, T: AxisAlignedBounding<V, Aab = T> + std::fmt::Debug + Clone, V : Colli
         return set;
     }
 
+    fn gjk_point_collision(&self, point: &Point3<f32>, collider: &V) -> bool {
+        // LETS GO
+        let collider_gjk_model = self.gjk_model_table.get(&collider.model_used()).unwrap();
+        for shape in collider_gjk_model.shapes.iter() {
+            let position = Vector3 { x: collider.position().x, y: collider.position().y, z: collider.position().z };
+            let shifted_gjk_model = shape.get_moved_and_scaled_position(position, collider.scale());
+            if shifted_gjk_model.contains_point(point) {
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn point_intersection(&self, point: &Point3<f32>) -> Option<V> where V: Clone {
         if self.root.is_none() {
             return None;
         }
         let mut stack = vec![self.root];
         while let Some(node) = stack.pop() {
-            if Wrapper(node).is_leaf() 
-                && Wrapper(node).aab().point_intersects(&point) {
-                return Some((Wrapper(node).collider().as_ref().unwrap()).clone());
-            } 
-            
-            if Wrapper(Wrapper(node).left_child()).aab().point_intersects(&point) {
-                stack.push(Wrapper(node).left_child());
-            }
-            if Wrapper(Wrapper(node).right_child()).aab().point_intersects(&point) {    
-                stack.push(Wrapper(node).right_child());
+            if Wrapper(node).is_leaf() {
+                if Wrapper(node).aab().point_intersects(&point) &&
+                        self.gjk_point_collision(&point, Wrapper(node).collider().as_ref().unwrap()) {
+                    return Some((Wrapper(node).collider().as_ref().unwrap()).clone());
+                }
+            } else {
+                if Wrapper(Wrapper(node).left_child()).aab().point_intersects(&point) {
+                    stack.push(Wrapper(node).left_child());
+                }
+                if Wrapper(Wrapper(node).right_child()).aab().point_intersects(&point) {    
+                    stack.push(Wrapper(node).right_child());
+                }
             }
         }
         None
@@ -400,6 +417,24 @@ impl<'a, T: AxisAlignedBounding<V, Aab = T> + std::fmt::Debug + Clone, V : Colli
         }
     }
 
+    // BOTH COLLIDERS CURRENTLY MUST HAVE A GJK_MODEL OR ELSE THIS WILL CRASH, LOOK INTO MAKING AABS INTO GJK_MODELS TO MAKE DYNAMIC
+    fn gjk_collision(&self, collider_a: &V, collider_b: &V) -> bool {
+        let first_models = self.gjk_model_table.get(&collider_a.model_used()).unwrap();
+        let second_models = self.gjk_model_table.get(&collider_b.model_used()).unwrap();
+        for first_shape in first_models.shapes.iter() {
+            let shift_a = Vector3 { x: collider_a.position().x, y: collider_a.position().y, z: collider_a.position().z };
+            let first_shifted_model = first_shape.get_moved_and_scaled_position(shift_a, collider_a.scale());
+            for second_shape in second_models.shapes.iter() {
+                let shift_b = Vector3 { x: collider_b.position().x, y: collider_b.position().y, z: collider_b.position().z };
+                let second_shifted_model = second_shape.get_moved_and_scaled_position(shift_b, collider_b.scale());
+                if gjk(first_shifted_model.as_ref(), second_shifted_model.as_ref()) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     fn get_collisions<'b>(&self, collision_node: &TreeNode<T, V>) -> Vec<(&'b V, &'b V)> {
         if self.root.is_none() {
             return vec![];
@@ -412,7 +447,9 @@ impl<'a, T: AxisAlignedBounding<V, Aab = T> + std::fmt::Debug + Clone, V : Colli
             while let Some(node) = stack.pop() {
                 if Wrapper(node).is_leaf() {
                     let node_collider = (*node.unwrap().as_ptr()).collider.as_ref().unwrap();
-                    if node_collider.id() != collider_id && Wrapper(node).aab().intersect(Wrapper(*collision_node).aab()) {
+                    if node_collider.id() != collider_id 
+                        && Wrapper(node).aab().intersect(Wrapper(*collision_node).aab()) 
+                            && self.gjk_collision(node_collider, collider) {
                         if node_collider.id() > collider_id {
                             node_vec.push((&collider, node_collider));
                         } else {
@@ -433,36 +470,80 @@ impl<'a, T: AxisAlignedBounding<V, Aab = T> + std::fmt::Debug + Clone, V : Colli
     }
 
     pub fn solve_collisions(&'a mut self) {
-        let collision_id_vec: Vec<(usize, Point3<f32>, T)> = self.node_iter().collect::<Vec<Option<NonNull<Node<T, V>>>>>().iter().map(|node| {
-            (Wrapper(*node).collider_id(), Wrapper(*node).collider().as_ref().unwrap().position(), (*Wrapper(*node).aab()).clone())
+        let collision_id_vec: Vec<(usize, Point3<f32>, T, &'a mut V)> = self.node_iter_mut().map(|node| {
+            (
+                Wrapper(*node).collider_id(), 
+                Wrapper(*node).collider().as_ref().unwrap().position(), 
+                (*Wrapper(*node).aab()).clone(), 
+                unsafe { (*node.unwrap().as_ptr()).collider.as_mut().unwrap() },
+            )
         }).collect();
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
         for collider in collision_id_vec {
-            self.update(collider.0, collider.1, &collider.2);
+            let aab_position = collider.2.position();
+            let old_position = collider.1;
+            let new_position = Point3 { 
+                x: old_position.x + rng.gen_range(-0.45..0.45),
+                y: old_position.y + rng.gen_range(-0.45..0.45),
+                z: old_position.z + rng.gen_range(-0.45..0.45),
+            };
+            self.update(collider.0, aab_position, new_position, &collider.2, collider.3);
+        }
+    }
+
+    fn node_iter_mut(&mut self) -> BVTreeNodeIterMut<T, V> {
+        BVTreeNodeIterMut {
+            queue: VecDeque::from([&mut self.root]),
+            _boo: PhantomData,
         }
     }
 
     fn node_iter(&self) -> BVTreeNodeIter<T, V> {
         BVTreeNodeIter {
-            queue: VecDeque::from([self.root]),
+            queue: VecDeque::from([&self.root]),
             _boo: PhantomData,
         }
     }
 }
 
 struct BVTreeNodeIter<'a, T: AxisAlignedBounding<V, Aab = T>, V : Collider> {
-    queue: VecDeque<TreeNode<T, V>>,
+    queue: VecDeque<&'a TreeNode<T, V>>,
     _boo: PhantomData<&'a TreeNode<T, V>>
 }
 
 impl<'a, T: AxisAlignedBounding<V, Aab = T>, V : Collider> Iterator for BVTreeNodeIter<'a, T, V> {
-    type Item = Option<NonNull<Node<T, V>>>;
+    type Item = &'a Option<NonNull<Node<T, V>>>;    
     
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(node) = self.queue.pop_front() {
             unsafe {
-                if !(*node.unwrap().as_ptr()).is_leaf() {
-                    self.queue.push_back((*node.unwrap().as_ptr()).left);
-                    self.queue.push_back((*node.unwrap().as_ptr()).right);
+                if !(Wrapper(*node).is_leaf()) {
+                    self.queue.push_back(&mut (*node.unwrap().as_ptr()).left);
+                    self.queue.push_back(&mut (*node.unwrap().as_ptr()).right);
+                } else {
+                    return Some(node);
+                }
+            }
+        }
+        None
+    }
+}
+
+struct BVTreeNodeIterMut<'a, T: AxisAlignedBounding<V, Aab = T>, V : Collider> {
+    queue: VecDeque<&'a mut TreeNode<T, V>>,
+    _boo: PhantomData<&'a TreeNode<T, V>>
+}
+
+impl<'a, T: AxisAlignedBounding<V, Aab = T>, V : Collider> Iterator for BVTreeNodeIterMut<'a, T, V> {
+    type Item = &'a mut Option<NonNull<Node<T, V>>>;
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(node) = self.queue.pop_front() {
+            unsafe {
+                if !(Wrapper(*node).is_leaf()) {
+                    self.queue.push_back(&mut (*node.unwrap().as_ptr()).left);
+                    self.queue.push_back(&mut (*node.unwrap().as_ptr()).right);
                 } else {
                     return Some(node);
                 }
@@ -483,7 +564,7 @@ impl<'a, T: AxisAlignedBounding<V, Aab = T>, V : Collider> Iterator for BVTreeIt
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(node) = self.queue.pop_front() {
             unsafe {
-                if !(*node.unwrap().as_ptr()).is_leaf() {
+                if !(Wrapper(node).is_leaf()) {
                     self.queue.push_back((*node.unwrap().as_ptr()).left);
                     self.queue.push_back((*node.unwrap().as_ptr()).right);
                 } else {
@@ -507,7 +588,7 @@ impl<'a, T: AxisAlignedBounding<V, Aab = T>, V: Collider> Iterator for BVTreeIte
 
         while let Some(node) = self.queue.pop_front() {
             unsafe {
-                if !(*node.unwrap().as_ptr()).is_leaf() {
+                if !(Wrapper(node).is_leaf()) {
                     self.queue.push_back((*node.unwrap().as_ptr()).left);
                     self.queue.push_back((*node.unwrap().as_ptr()).right);
                 } else {
@@ -577,7 +658,7 @@ impl<T, V> Debug for BVTree<T, V> where T: AxisAlignedBounding<V, Aab = T> + std
     }
 }
 
-pub struct ColliderPair<'a, V: Collider>(&'a V, &'a V);
+pub struct ColliderPair<'a, V: Collider>(pub &'a V,pub &'a V);
 
 impl<'a, V: Collider> Hash for ColliderPair<'a, V> {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -614,18 +695,26 @@ impl<'a, V: Collider + std::fmt::Debug> Debug for ColliderPair<'a, V> {
 mod test {
     use super::BVTree;
     use crate::aab::{AABRect};
-    use crate::Instance;
-    use cgmath::Rotation3;
+    use crate::{Instance, ModelUsed};
+    use cgmath::{Rotation3, Vector3};
+    use std::collections::HashMap;
+    use crate::gjk::GJKModel;
 
     #[test]
     fn test_basic_insert_and_delete() {
-        let mut m: BVTree<AABRect, Instance> = BVTree::new();
+        let gjk_model_table: HashMap<ModelUsed, GJKModel> = HashMap::new();
+        let mut m: BVTree<AABRect, Instance> = BVTree::new(gjk_model_table);
         for i in 1..4 {
             m.insert(Instance::new(
                 cgmath::Point3 {
                     x: -1.0 * i as f32,
                     y: -1.0 * i as f32,
                     z: -1.0 * i as f32,
+                },
+                Vector3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
                 },
                 {
                     cgmath::Quaternion::from_axis_angle(cgmath::Vector3::unit_z(), cgmath::Deg(0.0))
@@ -635,6 +724,7 @@ mod test {
                     y: 0.5 * i as f32,
                     z: 0.5 * i as f32,
                 },
+                crate::ModelUsed::None,
             ));
         }
         let size = m.size();
@@ -645,13 +735,19 @@ mod test {
 
     #[test]
     fn test_large_insert_and_delete() {
-        let mut m: BVTree<AABRect, Instance> = BVTree::new();
+        let gjk_model_table: HashMap<ModelUsed, GJKModel> = HashMap::new();
+        let mut m: BVTree<AABRect, Instance> = BVTree::new(gjk_model_table);
         for i in 1..50 {
             m.insert(Instance::new(
                 cgmath::Point3 {
                     x: -1.0 * i as f32,
                     y: -1.0 * i as f32,
                     z: -1.0 * i as f32,
+                },
+                Vector3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
                 },
                 {
                     cgmath::Quaternion::from_axis_angle(cgmath::Vector3::unit_z(), cgmath::Deg(0.0))
@@ -661,6 +757,7 @@ mod test {
                     y: 0.5 * i as f32,
                     z: 0.5 * i as f32,
                 },
+                crate::ModelUsed::None,
             ));
         }
         let size = m.size();

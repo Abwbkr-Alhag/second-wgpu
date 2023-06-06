@@ -6,7 +6,7 @@ use winit::{
 
 use wgpu::{util::DeviceExt, BindGroup};
 
-use cgmath::{prelude::*, Point3};
+use cgmath::{prelude::*, Point3, Vector3, Quaternion};
 // use std::cmp::Eq;
 
 #[cfg(target_arch = "wasm32")]
@@ -19,34 +19,113 @@ mod texture;
 mod collision;
 mod ray;
 mod aab;
+mod gjk;
 
-use model::{DrawModel, Vertex};
+use model::{DrawModel, DrawWireFrame, Vertex};
 use collision::{BVTree, Collider};
-use aab::{AABRect};
+use aab::{AABRect, WireframeRaw};
 use ray::Ray;
 
-use crate::{model::DrawWireFrame, aab::WireframeRaw};
+use crate::gjk::{GJKModel, load_gjk_model};
+use std::{cmp::Ordering, collections::HashMap};
+use std::ops::Range;
+
+const STONE_BLOCK_MASS: f32 = 5.0;
+
+pub trait ModelData {
+    type VertexType: model::Vertex;
+    fn model_used(&self) -> ModelUsed;
+    fn position(&self) -> Point3<f32>;
+    fn rotation(&self) -> Quaternion<f32>;
+    fn scale(&self) -> Vector3<f32>;
+    fn to_raw(&self) -> Self::VertexType;
+}
+
+impl ModelData for Instance {
+    type VertexType = InstanceRaw;
+
+    fn model_used(&self) -> ModelUsed {
+        self.model_used
+    }
+
+    fn position(&self) -> Point3<f32> {
+        self.position
+    }
+
+    fn rotation(&self) -> Quaternion<f32> {
+        self.rotation
+    }
+
+    fn scale(&self) -> Vector3<f32> {
+        self.scale
+    }
+
+    fn to_raw(&self) -> Self::VertexType {
+        self.to_raw()
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ModelUsed {
+    StoneBlock,
+    MetalPlate,
+    Triangle,
+    None,
+}
+impl Ord for ModelUsed {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (*self as usize).cmp(&(*other as usize))
+    }
+}
+
+impl PartialOrd for ModelUsed {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Instance {
     id: usize,
-    position: cgmath::Point3<f32>,
-    rotation: cgmath::Quaternion<f32>,
-    scale: cgmath::Vector3<f32>,
+    position: Point3<f32>,
+    velocity: Vector3<f32>,
+    force: Vector3<f32>,
+    mass: f32,
+    rotation: Quaternion<f32>,
+    scale: Vector3<f32>,
+    model_used: ModelUsed
 }
 
 impl Collider for Instance {
     fn position(&self) -> Point3<f32> {
         self.position
     }
-    fn scale(&self) -> cgmath::Vector3<f32> {
+    fn set_position(&mut self, new_position: cgmath::Point3<f32>) {
+        self.position = new_position;
+    }
+    fn velocity(&self) -> Vector3<f32> {
+        self.velocity
+    }
+    fn set_velocity(&mut self, new_velocity: Vector3<f32>) {
+        self.velocity = new_velocity;
+    }
+    fn force(&self) -> Vector3<f32> {
+        self.force
+    }
+    fn set_force(&mut self, new_force: Vector3<f32>) {
+        self.force = new_force;
+    }
+    fn mass(&self) -> f32 {
+        self.mass
+    }
+    fn scale(&self) -> Vector3<f32> {
         self.scale
     }
     fn id(&self) -> usize {
         self.id
     }
-    fn set_position(&mut self, new_position: cgmath::Point3<f32>) {
-        self.position = new_position;
+    fn model_used(&self) -> ModelUsed {
+        self.model_used
     }
 }
 
@@ -54,39 +133,46 @@ impl<'a> Default for Instance {
     fn default() -> Self {
         Self {
             id: 0,
-            position: cgmath::Point3 {
-                x: std::f32::INFINITY,
-                y: std::f32::INFINITY,
-                z: std::f32::INFINITY,
+            position: Point3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
             },
-            rotation: cgmath::Quaternion { 
-                v: cgmath::Vector3 { x: 0.0, y: 0.0, z: 0.0 }, 
+            velocity: Vector3 { x: 0.0, y: 0.0, z: 0.0 },
+            force: Vector3 { x: 0.0, y: 0.0, z: 0.0 },
+            mass: STONE_BLOCK_MASS,
+            rotation: Quaternion { 
+                v: Vector3 { x: 0.0, y: 0.0, z: 0.0 }, 
                 s: 0.0 
             },
-            scale: cgmath::Vector3 {
+            scale: Vector3 {
                 x: 1.0,
                 y: 1.0,
                 z: 1.0,
             },
+            model_used: ModelUsed::None,
         }
     }
 }
 
 impl Instance {
-    fn new(position: cgmath::Point3<f32>, rotation: cgmath::Quaternion<f32>, scale: cgmath::Vector3<f32>) -> Instance {
+    fn new(position: Point3<f32>, velocity: Vector3<f32>, rotation: Quaternion<f32>, scale: Vector3<f32>, model_used: ModelUsed) -> Instance {
         static mut COUNTER: usize = 1;
         let new_instance = Self {
             id: unsafe {  COUNTER  },
             position,
+            velocity,
             rotation,
             scale,
+            model_used,
+            ..Default::default()
         };
         unsafe { COUNTER+=1; }
         return new_instance;
     }
     fn to_raw(&self) -> InstanceRaw {
         let model =
-            cgmath::Matrix4::from_translation(cgmath::Vector3 {
+            cgmath::Matrix4::from_translation(Vector3 {
                 x: self.position.x,
                 y: self.position.y,
                 z: self.position.z
@@ -95,6 +181,18 @@ impl Instance {
             model: model.into(),
             normal: cgmath::Matrix3::from(self.rotation).into(),
             scale: self.scale.into()
+        }
+    }
+    fn to_wireframe_raw(&self) -> WireframeRaw {
+        let model =
+            cgmath::Matrix4::from_translation(cgmath::Vector3 {
+                x: self.position.x,
+                y: self.position.y,
+                z: self.position.z
+            });
+        WireframeRaw {
+            model: model.into(),
+            scale: self.scale.into(),
         }
     }
 }
@@ -107,7 +205,7 @@ pub struct InstanceRaw {
     scale: [f32; 3],
 }
 
-impl InstanceRaw {
+impl Vertex for InstanceRaw {
     fn desc<'a>() -> wgpu::VertexBufferLayout<'a> {
         use std::mem;
         wgpu::VertexBufferLayout {
@@ -175,6 +273,44 @@ struct LightUniform {
     _padding2: u32,
 }
 
+struct MultiModelData {
+    instance_buffer: wgpu::Buffer,
+    model_ranges: Vec<(ModelUsed, Range<u32>)>
+}
+
+fn create_multi_model_data<M: ModelData>(data: &mut Vec<&M>, device: &wgpu::Device) -> MultiModelData 
+    where <M as ModelData>::VertexType: bytemuck::Pod {
+    data.sort_by_key(|&inst| inst.model_used());
+
+    let raw_data: Vec<M::VertexType> = (data.to_owned()).into_iter().map(|value| {
+        value.to_raw()
+    }).collect::<Vec<M::VertexType>>();
+    let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("Instance Buffer"),
+        contents: bytemuck::cast_slice(&raw_data),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+
+    let mut model_ranges: Vec<(ModelUsed, Range<u32>)> = vec![];
+
+    let mut start = 0;
+    let mut current = 1;
+
+    while current < data.len() {
+        if data[current].model_used() != data[start].model_used() {
+            model_ranges.push((data[start].model_used(), ((start as u32)..(current as u32))));
+            start = current;
+        }
+        current += 1;
+    }
+    model_ranges.push((data[start].model_used(), ((start as u32)..(current as u32))));
+
+    MultiModelData {
+        instance_buffer,
+        model_ranges
+    }
+}
+
 struct State {
     surface: wgpu::Surface,
     device: wgpu::Device,
@@ -185,7 +321,7 @@ struct State {
     render_pipeline: wgpu::RenderPipeline,
     light_render_pipeline: wgpu::RenderPipeline,
     debug_pipeline: wgpu::RenderPipeline,
-    floor_model: model::Model,
+    model_table: HashMap<ModelUsed, model::Model>,
     debug_model: model::Model,
     light_model: model::Model,
     light_uniform: LightUniform,
@@ -198,7 +334,7 @@ struct State {
     camera_controller: camera::CameraController,
     projection: camera::Projection,
     collision_tree: BVTree<AABRect, Instance>,
-    instance_buffer: wgpu::Buffer,
+    instance_models: MultiModelData,
     tree_debug_buffer: wgpu::Buffer,
     depth_texture: texture::Texture,
     left_mouse_pressed: bool,
@@ -316,48 +452,108 @@ impl State {
         let mut rng = rand::thread_rng();
         use rand::Rng;
         const NUM_OF_INSTANCES: u32 = 25;
-        let instances: Vec<Instance> = (0..NUM_OF_INSTANCES).map(|_| {
+        let mut instances: Vec<Instance> = (0..NUM_OF_INSTANCES).map(|_| {
             Instance::new(
-                cgmath::Point3 {
-                    x: rng.gen_range(-100.0..100.0),
-                    y: rng.gen_range(-100.0..100.0),
-                    z: rng.gen_range(-100.0..100.0),
+                Point3 {
+                    x: rng.gen_range(-10.0..10.0),
+                    y: rng.gen_range(-10.0..10.0),
+                    z: rng.gen_range(-10.0..10.0),
+                },
+                Vector3 { 
+                    x: 0.0, 
+                    y: 0.0, 
+                    z: 0.0 
                 },
                 {
-                    cgmath::Quaternion::from_axis_angle(cgmath::Vector3::unit_z(), cgmath::Deg(0.0))
+                    Quaternion::from_axis_angle(Vector3::unit_z(), cgmath::Deg(0.0))
                 },
-                cgmath::Vector3 {
-                    x: rng.gen_range(0.25..5.0),
-                    y: rng.gen_range(0.25..5.0),
-                    z: rng.gen_range(0.25..5.0),
+                Vector3 {
+                    x: rng.gen_range(0.25..2.0),
+                    y: rng.gen_range(0.25..2.0),
+                    z: rng.gen_range(0.25..2.0),
                 },
+                if rng.gen_range(0.0..1.0) > 0.5 { ModelUsed::Triangle } else { ModelUsed::StoneBlock },
             )
         }).collect();
 
-        let instance_data: Vec<InstanceRaw> = instances.iter().map(|inst| Instance::to_raw(inst)).collect();
-        
-        let mut collision_tree: BVTree<AABRect, Instance> = BVTree::new();
-        for inst in instances {
-            collision_tree.insert(inst);
-        }
+        // let mut instances = vec![
+        //     Instance::new(
+        //         Point3 {
+        //             x: 2.0,
+        //             y: 2.0,
+        //             z: 2.0,
+        //         },
+        //         Vector3 { 
+        //             x: 0.0, 
+        //             y: 0.0, 
+        //             z: 0.0 
+        //         },
+        //         {
+        //             Quaternion::from_axis_angle(Vector3::unit_z(), cgmath::Deg(0.0))
+        //         },
+        //         Vector3 {
+        //             x: 1.0,
+        //             y: 1.0,
+        //             z: 1.0,
+        //         },
+        //         ModelUsed::Triangle,
+        //     ),
+        //     Instance::new(
+        //         Point3 {
+        //             x: -2.0,
+        //             y: -2.0,
+        //             z: -2.0,
+        //         },
+        //         Vector3 { 
+        //             x: 0.0, 
+        //             y: 0.0, 
+        //             z: 0.0 
+        //         },
+        //         {
+        //             Quaternion::from_axis_angle(Vector3::unit_z(), cgmath::Deg(0.0))
+        //         },
+        //         Vector3 {
+        //             x: 1.0,
+        //             y: 1.0,
+        //             z: 1.0,
+        //         },
+        //         ModelUsed::Triangle,
+        //     )
+        // ];
 
-        println!("{:?}", collision_tree.get_possible_pairs());
-
-        let tree_debug_data: Vec<WireframeRaw> = collision_tree.get_branches().iter().map(|branch| AABRect::to_raw(branch)).collect();
-
-        let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Instance Buffer"),
-            contents: bytemuck::cast_slice(&instance_data),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-
-        let tree_debug_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Tree Debug Buffer"),
-            contents: bytemuck::cast_slice(&tree_debug_data),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
+        instances.push(Instance::new(
+            Point3 {
+                x: 0.0,
+                y: -10.0,
+                z: 0.0,
+            },
+            Vector3 { 
+                x: 0.0, 
+                y: 0.0, 
+                z: 0.0 
+            },
+            {
+                Quaternion::from_axis_angle(Vector3::unit_z(), cgmath::Deg(0.0))
+            },
+            Vector3 {
+                x: 15.0,
+                y: 1.0,
+                z: 15.0,
+            },
+            ModelUsed::MetalPlate,
+        ));
             
-        let floor_model = resources::load_model(
+        let triangle_model = resources::load_model(
+            "tetra/tetra.obj",
+            &device,
+            &queue,
+            &texture_bind_group_layout,
+        )
+        .await
+        .unwrap();
+
+
+        let stone_block_model = resources::load_model(
             "cube/cube.obj",
             &device,
             &queue,
@@ -365,6 +561,54 @@ impl State {
         )
         .await
         .unwrap();
+
+        let floor_model = resources::load_model(
+            "floor/Sci-Fi-Floor.obj",
+            &device,
+            &queue,
+            &texture_bind_group_layout,
+        )
+        .await
+        .unwrap();
+
+        let mut model_table: HashMap<ModelUsed, model::Model> = HashMap::new();
+        model_table.insert(ModelUsed::Triangle, triangle_model);
+        model_table.insert(ModelUsed::StoneBlock, stone_block_model);
+        model_table.insert(ModelUsed::MetalPlate, floor_model);
+
+        let triangle_gjk_model: GJKModel = pollster::block_on(load_gjk_model("tetra/tetra_gjk.txt"));
+        let stone_gjk_model: GJKModel = pollster::block_on(load_gjk_model("cube/cube_gjk.txt"));
+        let floor_gjk_model: GJKModel = pollster::block_on(load_gjk_model("floor/floor_gjk.txt"));
+
+        println!("{:?}", stone_gjk_model);
+
+        let mut gjk_model_table: HashMap<ModelUsed, GJKModel> = HashMap::new();
+        gjk_model_table.insert(ModelUsed::Triangle, triangle_gjk_model);
+        gjk_model_table.insert(ModelUsed::StoneBlock, stone_gjk_model);
+        gjk_model_table.insert(ModelUsed::MetalPlate, floor_gjk_model);
+
+        let mut collision_tree: BVTree<AABRect, Instance> = BVTree::new(gjk_model_table);
+        for inst in instances {
+            collision_tree.insert(inst);
+        }
+        
+        let mut instance_data = collision_tree.iter().collect::<Vec<&Instance>>();
+        let instance_models = create_multi_model_data(&mut instance_data, &device);
+        
+        println!("{:?}", collision_tree.get_possible_pairs());
+
+        // for pair in collision_tree.get_possible_pairs() {
+        //     pair.0.
+        // }
+
+        let mut tree_debug_data: Vec<WireframeRaw> = collision_tree.get_branches().iter().map(|branch| AABRect::to_raw(branch)).collect();
+        tree_debug_data.extend::<Vec<WireframeRaw>>(collision_tree.iter().map(|leaf| Instance::to_wireframe_raw(leaf)).collect());
+
+        let tree_debug_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Tree Debug Buffer"),
+            contents: bytemuck::cast_slice(&tree_debug_data),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
 
         let debug_model = resources::load_wireframe_model(
             "wireframe/untitled.obj",
@@ -546,7 +790,7 @@ impl State {
             render_pipeline,
             light_render_pipeline,
             debug_pipeline,
-            floor_model,
+            model_table,
             debug_model,
             light_model,
             light_uniform,
@@ -559,7 +803,7 @@ impl State {
             camera_controller,
             projection,
             collision_tree,
-            instance_buffer,
+            instance_models,
             tree_debug_buffer,
             depth_texture,
             left_mouse_pressed: false,
@@ -621,14 +865,11 @@ impl State {
 
     fn update(&mut self, dt: std::time::Duration) {
         // Update the Collision Tree
-        self.collision_tree.solve_collisions();
-        let instance_data = self.collision_tree.iter().map(Instance::to_raw).collect::<Vec<InstanceRaw>>();
-        self.instance_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Instance Buffer"),
-            contents: bytemuck::cast_slice(&instance_data),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let tree_debug_data: Vec<WireframeRaw> = self.collision_tree.get_branches().iter().map(|branch| AABRect::to_raw(branch)).collect();
+        // self.collision_tree.solve_collisions();
+        let mut instance_data = self.collision_tree.iter().collect::<Vec<&Instance>>();
+        self.instance_models = create_multi_model_data(&mut instance_data, &self.device);
+        let mut tree_debug_data: Vec<WireframeRaw> = self.collision_tree.get_branches().iter().map(|branch| AABRect::to_raw(branch)).collect();
+        tree_debug_data.extend::<Vec<WireframeRaw>>(self.collision_tree.iter().map(|leaf| Instance::to_wireframe_raw(leaf)).collect());
         self.tree_debug_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Tree Debug Buffer"),
             contents: bytemuck::cast_slice(&tree_debug_data),
@@ -701,18 +942,21 @@ impl State {
             &self.light_bind_group,
         );
         render_pass.set_pipeline(&self.render_pipeline);
-        render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
-        render_pass.draw_model_instanced(
-            &self.floor_model,
-            0..self.collision_tree.size() as u32,
-            &self.camera_bind_group,
-            &self.light_bind_group,
-        );
+        render_pass.set_vertex_buffer(1, self.instance_models.instance_buffer.slice(..));
+        for (model_used, range) in self.instance_models.model_ranges.as_slice() {
+            let model = self.model_table.get(model_used).unwrap();
+            render_pass.draw_model_instanced(
+                &model,
+                range.clone(),
+                &self.camera_bind_group,
+                &self.light_bind_group,
+            );
+        }
         render_pass.set_pipeline(&self.debug_pipeline);
         render_pass.set_vertex_buffer(1, self.tree_debug_buffer.slice(..));
         render_pass.draw_wireframe_model_instanced(
             &self.debug_model, 
-            0..self.collision_tree.len_branches() as u32, 
+            0..(self.collision_tree.len_branches() + self.collision_tree.size()) as u32, 
             &self.camera_bind_group
         );
         drop(render_pass);

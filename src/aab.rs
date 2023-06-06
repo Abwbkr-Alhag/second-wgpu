@@ -3,7 +3,7 @@ use crate::collision::{Collider};
 use crate::ray::{Ray};
 use std::f32::consts::PI;
 
-pub(crate) const PADDING:f32 = 5.0;
+pub(crate) const PADDING:f32 = 0.0;
 
 pub trait AxisAlignedBounding<V: Collider> {
     type Aab: AxisAlignedBounding<V>;
@@ -190,7 +190,7 @@ impl std::fmt::Debug for AABRect {
             vec![self.center.x, self.center.y, self.center.z],
             vec![self.min_corner.x, self.min_corner.y, self.min_corner.z],
             vec![self.max_corner.x, self.max_corner.y, self.max_corner.z],
-            vec![self.scale.x, self.scale.x, self.scale.x],
+            vec![self.scale.x, self.scale.y, self.scale.z],
         );
         Ok(())
     }
@@ -199,8 +199,8 @@ impl std::fmt::Debug for AABRect {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct WireframeRaw {
-    model: [[f32; 4]; 4],
-    scale: [f32; 3],
+    pub model: [[f32; 4]; 4],
+    pub scale: [f32; 3],
 }
 
 impl WireframeRaw {
