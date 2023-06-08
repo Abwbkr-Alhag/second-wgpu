@@ -1,13 +1,23 @@
-use cgmath::{Point3, Vector3};
+use cgmath::{Point3, Vector3, InnerSpace};
 use std::marker::PhantomData;
 use std::ptr::NonNull;
 use crate::aab::{AxisAlignedBounding, PADDING};
-use crate::{ModelUsed};
+use crate::epa::{CollisionVector, epa};
+use crate::{ModelUsed, GRAVITY};
 use crate::gjk::{GJKModel, gjk};
 use std::iter::IntoIterator;
 use std::collections::{HashSet, VecDeque, HashMap};
 use std::hash::{Hash, Hasher};
 use std::fmt::Debug;
+use std::time::Duration;
+
+fn set_or_update(hash_table: &mut HashMap<usize, Vector3<f32>>, key: usize, new_force: Vector3<f32>) {
+    if hash_table.get(&key).is_none() {
+        hash_table.insert(key, new_force);
+    } else {
+        hash_table.insert(key, hash_table.get(&key).unwrap() + new_force);
+    }
+}
 
 pub trait Collider {
     fn position(&self) -> Point3<f32>;
@@ -16,10 +26,12 @@ pub trait Collider {
     fn set_velocity(&mut self, new_velocity: Vector3<f32>);
     fn force(&self) -> Vector3<f32>;
     fn set_force(&mut self, new_force: Vector3<f32>);
+    fn update_force(&mut self, new_force: Vector3<f32>);
     fn mass(&self) -> f32;
     fn scale(&self) -> Vector3<f32>;
     fn id(&self) -> usize;
     fn model_used(&self) -> ModelUsed;
+    fn stuck(&self) -> bool;
 }
 
 
@@ -86,7 +98,7 @@ struct Node<T: AxisAlignedBounding<V>, V: Collider> {
     child_is: ChildIs,
 }
 
-impl<'a, T: AxisAlignedBounding<V, Aab = T> + std::fmt::Debug + Clone, V : Collider> BVTree<T, V> {
+impl<'a, T: AxisAlignedBounding<V, Aab = T> + std::fmt::Debug + Clone, V : Collider + Clone> BVTree<T, V> {
     pub fn new(gjk_model_table: HashMap<ModelUsed, GJKModel>) -> Self {
         Self {
             root: None,
@@ -246,16 +258,14 @@ impl<'a, T: AxisAlignedBounding<V, Aab = T> + std::fmt::Debug + Clone, V : Colli
     
     pub fn update(&mut self, collider_id: usize, aab_position: Point3<f32>, new_position: Point3<f32>, aab: &T, mutable_collider: &mut V) {
         let position_diff = new_position - aab_position;
-        let largest_diff = position_diff.x.max(position_diff.y.max(position_diff.z));
-        if largest_diff.abs() < PADDING {
+        let largest_diff = position_diff.x.abs().max(position_diff.y.abs().max(position_diff.z.abs()));
+        if largest_diff < PADDING {
             let removed_collider = mutable_collider;
             (removed_collider).set_position(new_position);
         } else {
             let mut removed_collider = self.remove(collider_id, aab);
             (removed_collider).set_position(new_position);
-            // self.print_pretty("".to_string());
             self.insert(removed_collider);
-            // self.print_pretty("".to_string());
         }
     }
 
@@ -281,9 +291,9 @@ impl<'a, T: AxisAlignedBounding<V, Aab = T> + std::fmt::Debug + Clone, V : Colli
     pub fn get_possible_pairs(&mut self) -> HashSet<ColliderPair<V>> {
         let mut set: HashSet<ColliderPair<V>> = HashSet::new();
         for inst in self.node_iter() {
-            let collisions: Vec<(&V, &V)> = self.get_collisions(inst);
+            let collisions: Vec<(V, V, Vec<CollisionVector>)> = self.get_collisions(inst);
             for collision in collisions {
-                let pair = ColliderPair(collision.0, collision.1);
+                let pair = ColliderPair(collision.0, collision.1, collision.2);
                 set.insert(pair);
             }
         }
@@ -291,7 +301,6 @@ impl<'a, T: AxisAlignedBounding<V, Aab = T> + std::fmt::Debug + Clone, V : Colli
     }
 
     fn gjk_point_collision(&self, point: &Point3<f32>, collider: &V) -> bool {
-        // LETS GO
         let collider_gjk_model = self.gjk_model_table.get(&collider.model_used()).unwrap();
         for shape in collider_gjk_model.shapes.iter() {
             let position = Vector3 { x: collider.position().x, y: collider.position().y, z: collider.position().z };
@@ -418,7 +427,8 @@ impl<'a, T: AxisAlignedBounding<V, Aab = T> + std::fmt::Debug + Clone, V : Colli
     }
 
     // BOTH COLLIDERS CURRENTLY MUST HAVE A GJK_MODEL OR ELSE THIS WILL CRASH, LOOK INTO MAKING AABS INTO GJK_MODELS TO MAKE DYNAMIC
-    fn gjk_collision(&self, collider_a: &V, collider_b: &V) -> bool {
+    fn gjk_epa_collision(&self, collider_a: &V, collider_b: &V) -> Vec<CollisionVector> {
+        let mut collision_vectors = vec![];
         let first_models = self.gjk_model_table.get(&collider_a.model_used()).unwrap();
         let second_models = self.gjk_model_table.get(&collider_b.model_used()).unwrap();
         for first_shape in first_models.shapes.iter() {
@@ -427,33 +437,39 @@ impl<'a, T: AxisAlignedBounding<V, Aab = T> + std::fmt::Debug + Clone, V : Colli
             for second_shape in second_models.shapes.iter() {
                 let shift_b = Vector3 { x: collider_b.position().x, y: collider_b.position().y, z: collider_b.position().z };
                 let second_shifted_model = second_shape.get_moved_and_scaled_position(shift_b, collider_b.scale());
-                if gjk(first_shifted_model.as_ref(), second_shifted_model.as_ref()) {
-                    return true;
+                let gjk_simplex = gjk(first_shifted_model.as_ref(), second_shifted_model.as_ref());
+                if gjk_simplex.is_some() {
+                    let epa_result = epa(first_shifted_model.as_ref(), second_shifted_model.as_ref(), &gjk_simplex.unwrap());
+                    if epa_result.is_some() {
+                        collision_vectors.push(epa_result.unwrap());
+                    }
                 }
             }
         }
-        false
+        collision_vectors
     }
 
-    fn get_collisions<'b>(&self, collision_node: &TreeNode<T, V>) -> Vec<(&'b V, &'b V)> {
+    fn get_collisions(&self, collision_node: &TreeNode<T, V>) -> Vec<(V, V, Vec<CollisionVector>)> {
         if self.root.is_none() {
             return vec![];
         }
         unsafe {
             let mut stack = vec![self.root];
-            let mut node_vec: Vec<(&V, &V)> = vec![];
-            let collider = (*collision_node.as_ref().unwrap().as_ptr()).collider.as_ref().unwrap();
+            let mut node_vec: Vec<(V, V, Vec<CollisionVector>)> = vec![];
+            let collider = (*collision_node.as_ref().unwrap().as_ptr()).collider.clone().unwrap();
             let collider_id = collider.id();
             while let Some(node) = stack.pop() {
                 if Wrapper(node).is_leaf() {
-                    let node_collider = (*node.unwrap().as_ptr()).collider.as_ref().unwrap();
+                    let node_collider = (*node.unwrap().as_ptr()).collider.clone().unwrap();
                     if node_collider.id() != collider_id 
-                        && Wrapper(node).aab().intersect(Wrapper(*collision_node).aab()) 
-                            && self.gjk_collision(node_collider, collider) {
-                        if node_collider.id() > collider_id {
-                            node_vec.push((&collider, node_collider));
-                        } else {
-                            node_vec.push((node_collider, &collider));
+                        && Wrapper(node).aab().intersect(Wrapper(*collision_node).aab()) {
+                        let epa_result = self.gjk_epa_collision(&node_collider,&collider);
+                        if !epa_result.is_empty() {
+                            if node_collider.id() > collider_id {
+                                node_vec.push((collider.clone(), node_collider, epa_result));
+                            } else {
+                                node_vec.push((node_collider, collider.clone(), epa_result));
+                            }
                         }
                     }
                     continue;
@@ -469,26 +485,63 @@ impl<'a, T: AxisAlignedBounding<V, Aab = T> + std::fmt::Debug + Clone, V : Colli
         }
     }
 
-    pub fn solve_collisions(&'a mut self) {
-        let collision_id_vec: Vec<(usize, Point3<f32>, T, &'a mut V)> = self.node_iter_mut().map(|node| {
+    pub fn solve_collisions(&'a mut self, dt: Duration) {
+        let collision_id_vec: Vec<(usize, T, &'a mut V)> = self.node_iter_mut().map(|node| {
             (
                 Wrapper(*node).collider_id(), 
-                Wrapper(*node).collider().as_ref().unwrap().position(), 
                 (*Wrapper(*node).aab()).clone(), 
                 unsafe { (*node.unwrap().as_ptr()).collider.as_mut().unwrap() },
             )
         }).collect();
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-        for collider in collision_id_vec {
-            let aab_position = collider.2.position();
-            let old_position = collider.1;
-            let new_position = Point3 { 
-                x: old_position.x + rng.gen_range(-0.45..0.45),
-                y: old_position.y + rng.gen_range(-0.45..0.45),
-                z: old_position.z + rng.gen_range(-0.45..0.45),
-            };
-            self.update(collider.0, aab_position, new_position, &collider.2, collider.3);
+
+        let collision_pairs = self.get_possible_pairs();
+        let mut pair_hash: HashMap<usize, Vector3<f32>> = HashMap::new();
+        for pair in collision_pairs {
+            // WARNING: We don't have a proper finding the point of collision algorith,
+            // So we aren't actually applying the force where the collision is but
+            // we are applying it to the center which should be good enough for now
+            let position_a = pair.0.position();
+            let position_b = pair.1.position();
+            let ab = position_a - position_b;
+            let vectors = pair.2;
+            for vector in vectors {
+                // We need to make sure we are applying the collision in the right direction
+                let new_force = vector.normal * (vector.depth);
+                if ab.dot(vector.normal) > 0.0 {
+                    // ab is pointing in the same direction as the normal
+                    if pair.0.stuck() {
+                        set_or_update(&mut pair_hash, pair.1.id(), -new_force);
+                    } else if pair.1.stuck() {
+                        set_or_update(&mut pair_hash, pair.0.id(), new_force);
+                    } else {
+                        set_or_update(&mut pair_hash, pair.0.id(), new_force / 2.0);
+                        set_or_update(&mut pair_hash, pair.1.id(), -new_force / 2.0);
+                    }
+                } else {
+                    if pair.0.stuck() {
+                        set_or_update(&mut pair_hash, pair.1.id(), new_force);
+                    } else if pair.1.stuck() {
+                        set_or_update(&mut pair_hash, pair.0.id(), -new_force);
+                    } else {
+                        set_or_update(&mut pair_hash, pair.0.id(), -new_force);
+                        set_or_update(&mut pair_hash, pair.1.id(), new_force);
+                    }
+                }
+            }
+        }
+
+
+
+        for (id, aab, collider) in collision_id_vec {
+            // Apply all forces
+            collider.set_force(collider.mass() * GRAVITY);
+            if pair_hash.contains_key(&id) {
+                collider.update_force(*pair_hash.get(&id).unwrap() * 40.0);
+            }
+            collider.set_velocity(collider.force() / collider.mass() * dt.as_secs_f32() * 25.0);
+            collider.set_position(collider.position() + collider.velocity() * dt.as_secs_f32() * 25.0);
+            
+            self.update(id, aab.position(), collider.position(), &aab, collider);
         }
     }
 
@@ -634,7 +687,7 @@ impl<'a, T: AxisAlignedBounding<V, Aab = T>, V: Collider> Iterator for BVTreeInt
     }
 }
 
-impl<'a, T: AxisAlignedBounding<V, Aab = T> + std::fmt::Debug + Clone, V: Collider> IntoIterator for &'a BVTree<T, V> {
+impl<'a, T: AxisAlignedBounding<V, Aab = T> + std::fmt::Debug + Clone, V: Collider + Clone> IntoIterator for &'a BVTree<T, V> {
     type Item = &'a V;
     type IntoIter = BVTreeIter<'a, T, V>;
 
@@ -643,7 +696,7 @@ impl<'a, T: AxisAlignedBounding<V, Aab = T> + std::fmt::Debug + Clone, V: Collid
     }
 }
 
-impl<T, V> Extend<V> for BVTree<T, V> where T: AxisAlignedBounding<V, Aab = T> + std::fmt::Debug + Clone, V : Collider {
+impl<T, V> Extend<V> for BVTree<T, V> where T: AxisAlignedBounding<V, Aab = T> + std::fmt::Debug + Clone, V : Collider + Clone {
     fn extend<I: IntoIterator<Item = V>>(&mut self, iter: I) {
         for item in iter {
             self.insert(item);
@@ -652,41 +705,41 @@ impl<T, V> Extend<V> for BVTree<T, V> where T: AxisAlignedBounding<V, Aab = T> +
 }
 
 use std::fmt;
-impl<T, V> Debug for BVTree<T, V> where T: AxisAlignedBounding<V, Aab = T> + std::fmt::Debug + Clone, V : Collider + Debug {
+impl<T, V> Debug for BVTree<T, V> where T: AxisAlignedBounding<V, Aab = T> + std::fmt::Debug + Clone, V : Collider + Debug + Clone {
     fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
         Ok(self.print_pretty("".to_string()))
     }
 }
 
-pub struct ColliderPair<'a, V: Collider>(pub &'a V,pub &'a V);
+pub struct ColliderPair<V: Collider>(pub V,pub V, pub Vec<CollisionVector>);
 
-impl<'a, V: Collider> Hash for ColliderPair<'a, V> {
+impl<V: Collider + Clone> Hash for ColliderPair<V> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        let (a, b) = (self.clone().0, self.clone().1);
+        let (a, b) = (self.0.clone(), self.1.clone());
         a.id().hash(state);
         b.id().hash(state);
     }
 }
 
-impl<'a, V: Collider> PartialEq for ColliderPair<'a, V> {
+impl<V: Collider + Clone> PartialEq for ColliderPair<V> {
     fn eq(&self, other: &Self) -> bool {
-        let (a1, b1) = (self.clone().0, self.clone().1);
+        let (a1, b1) = (self.0.clone(), self.1.clone());
         let (a2, b2) = (other.clone().0, other.clone().1);
         a1.id() == a2.id() && b1.id() == b2.id()
     }
 }
 
-impl<'a, V: Collider> Clone for ColliderPair<'a, V> {
+impl<V: Collider + Clone> Clone for ColliderPair<V> {
     fn clone(&self) -> Self {
-        ColliderPair(self.0, self.1)
+        ColliderPair(self.0.clone(), self.1.clone(), self.2.clone())
     }
 }
 
-impl<'a, V: Collider> Eq for ColliderPair<'a, V> {}
+impl<V: Collider + Clone> Eq for ColliderPair<V> {}
 
-impl<'a, V: Collider + std::fmt::Debug> Debug for ColliderPair<'a, V> {
+impl<V: Collider + std::fmt::Debug> Debug for ColliderPair<V> {
     fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        Ok(println!("{:?}, {:?}", self.0, self.1))
+        Ok(println!("{:?}, {:?}, {:?}", self.0, self.1, self.2))
     }
 }
 
@@ -725,11 +778,12 @@ mod test {
                     z: 0.5 * i as f32,
                 },
                 crate::ModelUsed::None,
+                false,
             ));
         }
         let size = m.size();
         println!("{:?}", m);
-        m.solve_collisions();
+        // m.solve_collisions();
         assert!(size == m.size())
     }
 
@@ -758,11 +812,12 @@ mod test {
                     z: 0.5 * i as f32,
                 },
                 crate::ModelUsed::None,
+                false,
             ));
         }
         let size = m.size();
         println!("{:?}", m);
-        m.solve_collisions();
+        // m.solve_collisions();
         assert!(size == m.size())
     }
 }

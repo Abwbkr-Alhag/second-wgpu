@@ -33,8 +33,8 @@ pub trait GJKCollider {
     fn contains_point(&self, point: &Point3<f32>) -> bool;
 }
 
-struct Simplex {
-    points: [Vector3<f32>; 4],
+pub struct Simplex {
+    pub points: [Vector3<f32>; 4],
     size: usize,
 }
 
@@ -164,12 +164,12 @@ impl GJKCollider for Polygon {
     }
 }
 
-fn support<G: GJKCollider + ?Sized>(collider_a: &G, collider_b: &G, direction: &Vector3<f32>) -> Vector3<f32> {
+pub fn support<G: GJKCollider + ?Sized>(collider_a: &G, collider_b: &G, direction: &Vector3<f32>) -> Vector3<f32> {
     let opposite = Vector3 { x: -direction.x, y: -direction.y, z: -direction.z };
     collider_a.find_furthest_point(direction) - collider_b.find_furthest_point(&opposite)
 }
 
-pub fn gjk<G: GJKCollider + ?Sized>(collider_a: &G, collider_b: &G) -> bool {
+pub fn gjk<G: GJKCollider + ?Sized>(collider_a: &G, collider_b: &G) -> Option<Simplex> {
     let initial_vec = support(collider_a, collider_b, &Vector3::unit_x());
     let mut simplex = Simplex::new();
     simplex.add(initial_vec);
@@ -180,12 +180,12 @@ pub fn gjk<G: GJKCollider + ?Sized>(collider_a: &G, collider_b: &G) -> bool {
         let support = support(collider_a, collider_b, &mut direction);
 
         if support.dot(direction) <= 0.0 {
-            return false;
+            return None;
         }
         simplex.add(support);
 
         if next_simplex(&mut simplex, &mut direction) {
-            return true;
+            return Some(simplex);
         }
     }
 
@@ -302,7 +302,7 @@ fn parse_face(line: &str, polygon: &mut Polygon, normals: &Vec<Vector3<f32>>, ve
     let split = line.split("/");
     let mut vectors: Vec<Vector3<f32>> = Vec::new();
     for (_, float) in split.enumerate() {
-        if float.len() > 1 {
+        if float.split(" ").collect::<Vec<&str>>().len() > 1 {
             let last:Vec<&str> = float.split(" ").collect();
             let index: usize = last[0].parse::<usize>().expect("Cannot parse this line!") - 1;
             vectors.push(vertices[index]);
@@ -363,6 +363,7 @@ pub async fn load_gjk_model(
             Some("poly") => {
                 // That's the end of that polgyon
                 gjk_model.shapes.push(Box::new(polygon.clone()));
+                polygon = Polygon { faces: vec![] };
             },
             Some("f") => {
                 let rest = line[1..].trim();

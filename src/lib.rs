@@ -20,6 +20,7 @@ mod collision;
 mod ray;
 mod aab;
 mod gjk;
+mod epa;
 
 use model::{DrawModel, DrawWireFrame, Vertex};
 use collision::{BVTree, Collider};
@@ -31,6 +32,7 @@ use std::{cmp::Ordering, collections::HashMap};
 use std::ops::Range;
 
 const STONE_BLOCK_MASS: f32 = 5.0;
+const GRAVITY: Vector3<f32> = Vector3 { x: 0.0, y: -0.51, z: 0.0 };
 
 pub trait ModelData {
     type VertexType: model::Vertex;
@@ -70,6 +72,7 @@ pub enum ModelUsed {
     StoneBlock,
     MetalPlate,
     Triangle,
+    Cross,
     None,
 }
 impl Ord for ModelUsed {
@@ -93,7 +96,8 @@ pub struct Instance {
     mass: f32,
     rotation: Quaternion<f32>,
     scale: Vector3<f32>,
-    model_used: ModelUsed
+    model_used: ModelUsed,
+    stuck: bool,
 }
 
 impl Collider for Instance {
@@ -113,7 +117,14 @@ impl Collider for Instance {
         self.force
     }
     fn set_force(&mut self, new_force: Vector3<f32>) {
-        self.force = new_force;
+        if !self.stuck {
+            self.force = new_force;
+        }
+    }
+    fn update_force(&mut self, new_force: Vector3<f32>) {
+        if !self.stuck {
+            self.force += new_force;
+        }
     }
     fn mass(&self) -> f32 {
         self.mass
@@ -126,6 +137,9 @@ impl Collider for Instance {
     }
     fn model_used(&self) -> ModelUsed {
         self.model_used
+    }
+    fn stuck(&self) -> bool {
+        self.stuck
     }
 }
 
@@ -151,12 +165,13 @@ impl<'a> Default for Instance {
                 z: 1.0,
             },
             model_used: ModelUsed::None,
+            stuck: false,
         }
     }
 }
 
 impl Instance {
-    fn new(position: Point3<f32>, velocity: Vector3<f32>, rotation: Quaternion<f32>, scale: Vector3<f32>, model_used: ModelUsed) -> Instance {
+    fn new(position: Point3<f32>, velocity: Vector3<f32>, rotation: Quaternion<f32>, scale: Vector3<f32>, model_used: ModelUsed, stuck: bool) -> Instance {
         static mut COUNTER: usize = 1;
         let new_instance = Self {
             id: unsafe {  COUNTER  },
@@ -165,6 +180,7 @@ impl Instance {
             rotation,
             scale,
             model_used,
+            stuck,
             ..Default::default()
         };
         unsafe { COUNTER+=1; }
@@ -455,9 +471,9 @@ impl State {
         let mut instances: Vec<Instance> = (0..NUM_OF_INSTANCES).map(|_| {
             Instance::new(
                 Point3 {
-                    x: rng.gen_range(-10.0..10.0),
-                    y: rng.gen_range(-10.0..10.0),
-                    z: rng.gen_range(-10.0..10.0),
+                    x: rng.gen_range(-8.0..8.0),
+                    y: rng.gen_range(0.0..40.0),
+                    z: rng.gen_range(-8.0..8.0),
                 },
                 Vector3 { 
                     x: 0.0, 
@@ -465,61 +481,19 @@ impl State {
                     z: 0.0 
                 },
                 {
-                    Quaternion::from_axis_angle(Vector3::unit_z(), cgmath::Deg(0.0))
+                    Quaternion::from_axis_angle(Vector3::unit_z(), cgmath::Deg(rng.gen_range(0.0..180.0)))
                 },
                 Vector3 {
                     x: rng.gen_range(0.25..2.0),
                     y: rng.gen_range(0.25..2.0),
                     z: rng.gen_range(0.25..2.0),
                 },
-                if rng.gen_range(0.0..1.0) > 0.5 { ModelUsed::Triangle } else { ModelUsed::StoneBlock },
+                if rng.gen_range(0.0..1.0) > 0.5 { ModelUsed::Cross } else {  
+                    if rng.gen_range(0.0..1.0) > 0.5 {ModelUsed::StoneBlock } else { ModelUsed::Triangle }
+                },
+                false
             )
         }).collect();
-
-        // let mut instances = vec![
-        //     Instance::new(
-        //         Point3 {
-        //             x: 2.0,
-        //             y: 2.0,
-        //             z: 2.0,
-        //         },
-        //         Vector3 { 
-        //             x: 0.0, 
-        //             y: 0.0, 
-        //             z: 0.0 
-        //         },
-        //         {
-        //             Quaternion::from_axis_angle(Vector3::unit_z(), cgmath::Deg(0.0))
-        //         },
-        //         Vector3 {
-        //             x: 1.0,
-        //             y: 1.0,
-        //             z: 1.0,
-        //         },
-        //         ModelUsed::Triangle,
-        //     ),
-        //     Instance::new(
-        //         Point3 {
-        //             x: -2.0,
-        //             y: -2.0,
-        //             z: -2.0,
-        //         },
-        //         Vector3 { 
-        //             x: 0.0, 
-        //             y: 0.0, 
-        //             z: 0.0 
-        //         },
-        //         {
-        //             Quaternion::from_axis_angle(Vector3::unit_z(), cgmath::Deg(0.0))
-        //         },
-        //         Vector3 {
-        //             x: 1.0,
-        //             y: 1.0,
-        //             z: 1.0,
-        //         },
-        //         ModelUsed::Triangle,
-        //     )
-        // ];
 
         instances.push(Instance::new(
             Point3 {
@@ -541,6 +515,7 @@ impl State {
                 z: 15.0,
             },
             ModelUsed::MetalPlate,
+            true
         ));
             
         let triangle_model = resources::load_model(
@@ -571,21 +546,33 @@ impl State {
         .await
         .unwrap();
 
+        let cross_model = resources::load_model(
+            "cross/cross.obj", 
+            &device, 
+            &queue, 
+            &texture_bind_group_layout
+        )
+        .await
+        .unwrap();
+
         let mut model_table: HashMap<ModelUsed, model::Model> = HashMap::new();
         model_table.insert(ModelUsed::Triangle, triangle_model);
         model_table.insert(ModelUsed::StoneBlock, stone_block_model);
         model_table.insert(ModelUsed::MetalPlate, floor_model);
+        model_table.insert(ModelUsed::Cross, cross_model);
 
         let triangle_gjk_model: GJKModel = pollster::block_on(load_gjk_model("tetra/tetra_gjk.txt"));
         let stone_gjk_model: GJKModel = pollster::block_on(load_gjk_model("cube/cube_gjk.txt"));
         let floor_gjk_model: GJKModel = pollster::block_on(load_gjk_model("floor/floor_gjk.txt"));
+        let cross_gjk_model: GJKModel = pollster::block_on(load_gjk_model("cross/cross_gjk.txt"));
 
-        println!("{:?}", stone_gjk_model);
+        println!("{:?}", cross_gjk_model);
 
         let mut gjk_model_table: HashMap<ModelUsed, GJKModel> = HashMap::new();
         gjk_model_table.insert(ModelUsed::Triangle, triangle_gjk_model);
         gjk_model_table.insert(ModelUsed::StoneBlock, stone_gjk_model);
         gjk_model_table.insert(ModelUsed::MetalPlate, floor_gjk_model);
+        gjk_model_table.insert(ModelUsed::Cross, cross_gjk_model);
 
         let mut collision_tree: BVTree<AABRect, Instance> = BVTree::new(gjk_model_table);
         for inst in instances {
@@ -596,10 +583,6 @@ impl State {
         let instance_models = create_multi_model_data(&mut instance_data, &device);
         
         println!("{:?}", collision_tree.get_possible_pairs());
-
-        // for pair in collision_tree.get_possible_pairs() {
-        //     pair.0.
-        // }
 
         let mut tree_debug_data: Vec<WireframeRaw> = collision_tree.get_branches().iter().map(|branch| AABRect::to_raw(branch)).collect();
         tree_debug_data.extend::<Vec<WireframeRaw>>(collision_tree.iter().map(|leaf| Instance::to_wireframe_raw(leaf)).collect());
@@ -827,6 +810,95 @@ impl State {
         }
     }
 
+    fn keyboard_input(&mut self, keyboard_input: &KeyboardInput) {
+        if keyboard_input.state == ElementState::Released {
+            return;
+        }
+        let key = keyboard_input.virtual_keycode;
+        if key.is_none() {
+            return;
+        }
+        let mut rng = rand::thread_rng();
+        use rand::Rng;
+        match key.unwrap() {
+            VirtualKeyCode::Key1 => {
+                self.collision_tree.insert(Instance::new(
+                    Point3 {
+                        x: rng.gen_range(-8.0..8.0),
+                        y: rng.gen_range(0.0..40.0),
+                        z: rng.gen_range(-8.0..8.0),
+                    },
+                    Vector3 { 
+                        x: 0.0, 
+                        y: 0.0, 
+                        z: 0.0 
+                    },
+                    {
+                        Quaternion::from_axis_angle(Vector3::unit_z(), cgmath::Deg(rng.gen_range(0.0..180.0)))
+                    },
+                    Vector3 {
+                        x: rng.gen_range(0.25..2.0),
+                        y: rng.gen_range(0.25..2.0),
+                        z: rng.gen_range(0.25..2.0),
+                    },
+                    ModelUsed::StoneBlock,
+                    false
+                ));
+            },
+            VirtualKeyCode::Key2 => {
+                self.collision_tree.insert(Instance::new(
+                    Point3 {
+                        x: rng.gen_range(-8.0..8.0),
+                        y: rng.gen_range(0.0..40.0),
+                        z: rng.gen_range(-8.0..8.0),
+                    },
+                    Vector3 { 
+                        x: 0.0, 
+                        y: 0.0, 
+                        z: 0.0 
+                    },
+                    {
+                        Quaternion::from_axis_angle(Vector3::unit_z(), cgmath::Deg(rng.gen_range(0.0..180.0)))
+                    },
+                    Vector3 {
+                        x: rng.gen_range(0.25..2.0),
+                        y: rng.gen_range(0.25..2.0),
+                        z: rng.gen_range(0.25..2.0),
+                    },
+                    ModelUsed::Triangle,
+                    false
+                ));
+            },
+            VirtualKeyCode::Key3 => {
+                self.collision_tree.insert(Instance::new(
+                    Point3 {
+                        x: rng.gen_range(-8.0..8.0),
+                        y: rng.gen_range(0.0..40.0),
+                        z: rng.gen_range(-8.0..8.0),
+                    },
+                    Vector3 { 
+                        x: 0.0, 
+                        y: 0.0, 
+                        z: 0.0 
+                    },
+                    {
+                        Quaternion::from_axis_angle(Vector3::unit_z(), cgmath::Deg(rng.gen_range(0.0..180.0)))
+                    },
+                    Vector3 {
+                        x: rng.gen_range(0.25..2.0),
+                        y: rng.gen_range(0.25..2.0),
+                        z: rng.gen_range(0.25..2.0),
+                    },
+                    ModelUsed::Cross,
+                    false
+                ));
+            },
+            _ => {
+                return;
+            }
+        }
+    }
+
     fn input(&mut self, event: &WindowEvent, mouse_pos: (f64, f64)) -> bool {
         match event {
             WindowEvent::KeyboardInput {
@@ -865,7 +937,7 @@ impl State {
 
     fn update(&mut self, dt: std::time::Duration) {
         // Update the Collision Tree
-        // self.collision_tree.solve_collisions();
+        self.collision_tree.solve_collisions(dt);
         let mut instance_data = self.collision_tree.iter().collect::<Vec<&Instance>>();
         self.instance_models = create_multi_model_data(&mut instance_data, &self.device);
         let mut tree_debug_data: Vec<WireframeRaw> = self.collision_tree.get_branches().iter().map(|branch| AABRect::to_raw(branch)).collect();
@@ -1066,8 +1138,6 @@ pub async fn run() {
             } => {
                 if state.left_mouse_pressed {
                     state.camera_controller.process_mouse(delta.0, delta.1)
-                } else if state.right_mouse_pressed {
-                    // TODO:
                 }
             }
             Event::WindowEvent {
@@ -1085,6 +1155,9 @@ pub async fn run() {
                         },
                     ..
                 } => *control_flow = ControlFlow::Exit,
+                WindowEvent::KeyboardInput {input, ..} => {
+                    state.keyboard_input(input)
+                },
                 WindowEvent::Resized(physical_size) => {
                     state.resize(*physical_size);
                 },

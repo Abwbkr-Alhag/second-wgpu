@@ -1,4 +1,0 @@
-# ONLY FOR COLLISION TESTING WITH GJK
-mtllib test/test_gjk.mtl
-usemtl diffuse_0_0_0_255
-

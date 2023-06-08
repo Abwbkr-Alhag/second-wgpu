@@ -3,7 +3,7 @@ use crate::collision::{Collider};
 use crate::ray::{Ray};
 use std::f32::consts::PI;
 
-pub(crate) const PADDING:f32 = 0.0;
+pub(crate) const PADDING:f32 = 0.25;
 
 pub trait AxisAlignedBounding<V: Collider> {
     type Aab: AxisAlignedBounding<V>;
